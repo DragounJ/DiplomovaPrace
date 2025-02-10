@@ -1,4 +1,4 @@
-from transformers import Trainer, TrainingArguments, MobileNetV2Config, MobileNetV2ForImageClassification, EarlyStoppingCallback
+from transformers import Trainer, TrainingArguments, MobileNetV2Config, MobileNetV2ForImageClassification
 from torchvision.transforms import v2 as transformsv2
 from torch.utils.data import Dataset
 import torch.nn.functional as F
@@ -116,17 +116,26 @@ class CustomCIFAR100L(Dataset):
 
         if self.dataset_part == dataset_part.TRAIN:
             data_file = os.path.join(self.root, 'cifar-100-python', 'train')
+            with open(data_file, 'rb') as fo:
+                dict = pickle.load(fo, encoding='bytes')
+                self.data.append(dict[b'data'])
+                self.targets.extend(dict[b'fine_labels'])
+                self.logits.extend(dict[b'logits'])  
+                self.logits_aug.extend(dict[b'logits_aug'])   
         elif self.dataset_part == dataset_part.TEST:
             data_file = os.path.join(self.root, 'cifar-100-python', 'test')
+            with open(data_file, 'rb') as fo:
+                dict = pickle.load(fo, encoding='bytes')
+                self.data.append(dict[b'data'])
+                self.targets.extend(dict[b'fine_labels'])
+                self.logits.extend(dict[b'logits'])  
         else:
             data_file = os.path.join(self.root, 'cifar-100-python', 'eval')
-
-        with open(data_file, 'rb') as fo:
-            dict = pickle.load(fo, encoding='bytes')
-            self.data.append(dict[b'data'])
-            self.targets.extend(dict[b'fine_labels'])
-            self.logits.extend(dict[b'logits'])  
-            self.logits_aug.extend(dict[b'logits_aug'])   
+            with open(data_file, 'rb') as fo:
+                dict = pickle.load(fo, encoding='bytes')
+                self.data.append(dict[b'data'])
+                self.targets.extend(dict[b'fine_labels'])
+                self.logits.extend(dict[b'logits'])  
             
         self.data = np.concatenate(self.data, axis=0)
 
@@ -292,6 +301,7 @@ def check_acc(dataset):
 
 
 def remove_diff_pred_class(normal, aug):
+    """Removes those entries from aug, that do not have the same biggest logit as normal."""
     rem_ls = []
     for index, val in enumerate(aug):
         target_alt = torch.topk(val["logits"], k=1).indices.numpy()[0]
@@ -303,6 +313,7 @@ def remove_diff_pred_class(normal, aug):
 
 
 def compute_metrics(eval_pred):
+    """Computes metrics for HuggingFace trainer."""
     accuracy_metric = evaluate.load("accuracy")
     precision_metric = evaluate.load("precision")
     recall_metric = evaluate.load("recall")
@@ -325,6 +336,7 @@ def compute_metrics(eval_pred):
 
 
 class Custom_training_args(TrainingArguments):
+    """Custom wrapper of training args for distillation."""
     def __init__(self, lambda_param, temperature, *args, **kwargs):
         super().__init__(*args, **kwargs)    
         self.lambda_param = lambda_param
@@ -332,6 +344,7 @@ class Custom_training_args(TrainingArguments):
 
 
 def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e-5, epochs=5, weight_decay=0, lambda_param=.5, temp=5):
+    """Returns training args that can be adjusted."""
     return (
         Custom_training_args(
         output_dir=output_dir,
@@ -355,6 +368,7 @@ def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e
 
 
 def get_random_init_mobilenet(num_labels):
+    """Returns randomly initialized MobileNetV2."""
     reset_seed(42)
     student_config = MobileNetV2Config()
     student_config.num_labels = num_labels
@@ -362,6 +376,7 @@ def get_random_init_mobilenet(num_labels):
 
 
 def get_mobilenet(num_labels):
+    """Returns initialized MobileNetV2."""
     model_pretrained = MobileNetV2ForImageClassification.from_pretrained("google/mobilenet_v2_1.0_224")
     in_features = model_pretrained.classifier.in_features
 
@@ -373,6 +388,7 @@ def get_mobilenet(num_labels):
 
 
 def freeze_model(model):
+    """Freezes all params apart from classification head."""
     for param in model.parameters():
         param.requires_grad = False
 
@@ -382,6 +398,7 @@ def freeze_model(model):
     return model
 
 class ImageDistilTrainer(Trainer):
+    """Distilation trainer, computes loss with logits from teacher in mind. Logits are precomputed."""
     def __init__(self, student_model=None, *args, **kwargs):
         super().__init__(model=student_model, *args, **kwargs)
         self.student = student_model
