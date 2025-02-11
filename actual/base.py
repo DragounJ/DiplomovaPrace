@@ -6,6 +6,7 @@ from tqdm.notebook import tqdm
 from enum import Enum
 from PIL import Image
 import torch.nn as nn
+import pandas as pd
 import numpy as np
 import evaluate
 import pickle
@@ -274,10 +275,10 @@ def pickle_up(file, contents):
         pickle.dump(contents, fo, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def generate_logits(dataloder, model):
+def generate_logits(dataloader, model):
     """Generates logits for given input."""
     logits_arr = []
-    for batch in tqdm(dataloder):
+    for batch in tqdm(dataloader):
         pixel_values, labels = batch
         with torch.no_grad():
             outputs = model(pixel_values)
@@ -343,7 +344,7 @@ class Custom_training_args(TrainingArguments):
         self.temperature = temperature
 
 
-def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e-5, epochs=5, weight_decay=0, lambda_param=.5, temp=5):
+def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e-5, epochs=5, weight_decay=0, lambda_param=.5, temp=5, batch_size=128):
     """Returns training args that can be adjusted."""
     return (
         Custom_training_args(
@@ -352,8 +353,8 @@ def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e
         save_strategy="epoch",
         logging_strategy="epoch",
         learning_rate=lr, #Defaultní hodnota 
-        per_device_train_batch_size=128,
-        per_device_eval_batch_size=128,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
         num_train_epochs=epochs,
         weight_decay=weight_decay,
         seed = 42,  #Defaultní hodnota 
@@ -419,5 +420,30 @@ class ImageDistilTrainer(Trainer):
 
         loss = ((1. - self.lambda_param) * student_target_loss + self.lambda_param * distillation_loss)
         return (loss, student_output) if return_outputs else loss
+    
+def count_parameters(model):
+    table_header = [["Modules", "Parameters"]]
+    table = []
+    total_params = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        params = parameter.numel()
+        table.append([name, params])
+        total_params += params
+
+    param_size = 0
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+    buffer_size = 0
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+
+    size_all_mb = (param_size + buffer_size) / 1024**2
+    print('model size: {:.3f}MB.'.format(size_all_mb))
+    table = pd.DataFrame(table, None, table_header)
+    table.reset_index(drop=True, inplace=True)
+    print(f"Total Trainable Params: {total_params}.")
+    return table
     
 
