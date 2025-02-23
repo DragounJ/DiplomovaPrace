@@ -192,6 +192,8 @@ class CustomCIFAR10(Dataset):
             self.data = dict[b'data']
             self.labels = dict[b'labels']
 
+        #self.labels = nn.functional.one_hot(torch.as_tensor(self.labels),10)
+
     def __len__(self):
         return len(self.data)
 
@@ -275,13 +277,18 @@ def pickle_up(file, contents):
         pickle.dump(contents, fo, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def generate_logits(dataloader, model):
+def generate_logits(dataloader, model, images=True):
     """Generates logits for given input."""
     logits_arr = []
-    for batch in tqdm(dataloader):
-        pixel_values, labels = batch
+    for batch in tqdm(dataloader, desc="Generating logits for given dataset: "):
+        
         with torch.no_grad():
-            outputs = model(pixel_values)
+            if images:
+                pixel_values, labels = batch
+                outputs = model(pixel_values)
+            else:
+                outputs = model(batch["input_ids"],batch["attention_mask"])
+
             logits = outputs.logits
         logits_arr.append(logits.cpu().numpy())
 
@@ -292,24 +299,28 @@ def generate_logits(dataloader, model):
 
 
 
-def check_acc(dataset):
+def check_acc(dataset, desc="Accuracy for given set is: "):
     """Swift Acc checker for given dataset and its appended logits."""
     corr = []
-    for val in tqdm(dataset):
+    for val in tqdm(dataset, desc="Calculating accuracy based on the saved logits: "): 
         if torch.topk(val["logits"], k=1).indices.numpy()[0] == val["labels"]:  corr.append(True)
     
-    return(f"Accuracy for given set is: {len(corr)/len(dataset)}")  
+    return(f"{desc} {len(corr)/len(dataset)}")  
 
 
-def remove_diff_pred_class(normal, aug):
+def remove_diff_pred_class(normal, aug, pytorch_dataset=True):
     """Removes those entries from aug, that do not have the same biggest logit as normal."""
     rem_ls = []
-    for index, val in enumerate(aug):
+    for index, val in tqdm(enumerate(aug), total=len(aug), desc="Removing entries from augmented dataset that are different from the base one - based on saved logits: "):
         target_alt = torch.topk(val["logits"], k=1).indices.numpy()[0]
         target_act = torch.topk(normal[index]["logits"], k=1).indices.numpy()[0]
         if target_alt != target_act:
             rem_ls.append(index)
-    aug.remove_entries(rem_ls)
+    if pytorch_dataset:
+        aug.remove_entries(rem_ls)
+    else:
+        indices_to_keep = [i for i in range(len(aug)) if i not in rem_ls]
+        aug = aug.select(indices_to_keep)
     return aug
 
 
@@ -409,14 +420,14 @@ class ImageDistilTrainer(Trainer):
 
     def compute_loss(self, student, inputs, return_outputs=False, num_items_in_batch=None):
         logits = inputs.pop("logits")
-
+        
         student_output = student(**inputs)
-
+        
         soft_teacher = F.softmax(logits / self.temperature, dim=-1)
-        soft_student = F.log_softmax(student_output.logits / self.temperature, dim=-1)
+        soft_student = F.log_softmax(student_output['logits'] / self.temperature, dim=-1)
 
         distillation_loss = self.loss_function(soft_student, soft_teacher) * (self.temperature ** 2)
-        student_target_loss = student_output.loss
+        student_target_loss = student_output["loss"]
 
         loss = ((1. - self.lambda_param) * student_target_loss + self.lambda_param * distillation_loss)
         return (loss, student_output) if return_outputs else loss
@@ -446,4 +457,8 @@ def count_parameters(model):
     print(f"Total Trainable Params: {total_params}.")
     return table
     
-
+def prepare_dataset(dataset, tokenizer):
+    dataset = dataset.map(lambda e: tokenizer(e['sentence'], truncation=True, padding='max_length', return_tensors="pt", max_length=300), batched=True, desc="Tokenizing the provided dataset")
+    dataset = dataset.rename_column("label", "labels")
+    dataset.set_format(type='torch', columns=['input_ids', "attention_mask"], device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    return dataset
