@@ -409,7 +409,7 @@ def freeze_model(model):
 
     return model
 
-class ImageDistilTrainer(Trainer):
+class DistilTrainer(Trainer):
     """Distilation trainer, computes loss with logits from teacher in mind. Logits are precomputed."""
     def __init__(self, student_model=None, *args, **kwargs):
         super().__init__(model=student_model, *args, **kwargs)
@@ -462,3 +462,31 @@ def prepare_dataset(dataset, tokenizer):
     dataset = dataset.rename_column("label", "labels")
     dataset.set_format(type='torch', columns=['input_ids', "attention_mask"], device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
     return dataset
+
+
+class BiLSTMClassifier(nn.Module):
+    def __init__(self, embedding_dim, hidden_dim, fc_dim, output_dim, embedding_matrix):
+        super(BiLSTMClassifier, self).__init__()
+        
+        self.embedding = nn.Embedding.from_pretrained(embedding_matrix, freeze=True)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers=1, bidirectional=True, batch_first=True)
+        self.fc1 = nn.Linear(hidden_dim * 2, fc_dim)  
+        self.dropout = nn.Dropout(.2)
+        self.fc2 = nn.Linear(fc_dim, output_dim)
+
+    def forward(self, input_ids, labels=None):
+        embedded = self.embedding(input_ids)  
+        _, (h_n, _) = self.lstm(embedded)
+        h_forward = h_n[-2, :, :]  # Last forward hidden state
+        h_backward = h_n[-1, :, :]  # Last backward hidden state
+        out_cat = torch.cat((h_forward, h_backward), dim=1)
+        fc1_out = F.relu(self.fc1(out_cat))
+        dropped = self.dropout(fc1_out)
+        logits = self.fc2(dropped)
+        
+        if labels is not None:
+            labels = nn.functional.one_hot(labels, num_classes=self.fc2.out_features) 
+            loss_fn = nn.CrossEntropyLoss() 
+            loss = loss_fn(logits, labels.float())
+            return {"loss" : loss, "logits" : logits}
+        return {"loss" : None, "logits": logits}
