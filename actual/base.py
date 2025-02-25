@@ -1,4 +1,4 @@
-from transformers import Trainer, TrainingArguments, MobileNetV2Config, MobileNetV2ForImageClassification
+from transformers import Trainer, TrainingArguments, MobileNetV2Config, MobileNetV2ForImageClassification, BasicTokenizer
 from torchvision.transforms import v2 as transformsv2
 from torch.utils.data import Dataset
 import torch.nn.functional as F
@@ -12,7 +12,14 @@ import evaluate
 import pickle
 import random
 import torch
+import nltk
 import os
+
+nltk.download('averaged_perceptron_tagger')
+nltk.download('punkt')
+nltk.download('punkt_tab')
+nltk.download('averaged_perceptron_tagger_eng')
+
 
 def get_dataset_part():
     """Returns ENUM of dataset_parts"""
@@ -287,9 +294,9 @@ def generate_logits(dataloader, model, images=True):
                 pixel_values, labels = batch
                 outputs = model(pixel_values)
             else:
-                outputs = model(batch["input_ids"],batch["attention_mask"])
+                outputs = model(**batch)
 
-            logits = outputs.logits
+            logits = outputs["logits"]
         logits_arr.append(logits.cpu().numpy())
 
     logits_arr_flat = []
@@ -458,7 +465,7 @@ def count_parameters(model):
     return table
     
 def prepare_dataset(dataset, tokenizer):
-    dataset = dataset.map(lambda e: tokenizer(e['sentence'], truncation=True, padding='max_length', return_tensors="pt", max_length=300), batched=True, desc="Tokenizing the provided dataset")
+    dataset = dataset.map(lambda e: tokenizer(e['sentence'], truncation=True, padding='max_length', return_tensors="pt", max_length=60), batched=True, desc="Tokenizing the provided dataset")
     dataset = dataset.rename_column("label", "labels")
     dataset.set_format(type='torch', columns=['input_ids', "attention_mask"], device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
     return dataset
@@ -490,3 +497,98 @@ class BiLSTMClassifier(nn.Module):
             loss = loss_fn(logits, labels.float())
             return {"loss" : loss, "logits" : logits}
         return {"loss" : None, "logits": logits}
+    
+
+def get_pos_tag_word_map(sentences, tokenizer=BasicTokenizer(do_lower_case=True)):
+    pos_tag_word_map = {}
+    for sentence in sentences:
+        for token, pos_tag in nltk.pos_tag(tokenizer.tokenize(sentence)):
+            if pos_tag not in pos_tag_word_map.keys():
+                pos_tag_word_map[pos_tag] = set()
+                pos_tag_word_map[pos_tag].add(token)
+
+    pos_tag_word_map_list = {}
+    for pos_tag in pos_tag_word_map.keys():
+        pos_tag_word_map_list[pos_tag] = list(pos_tag_word_map[pos_tag])
+    return pos_tag_word_map_list
+
+def get_augmented_dataset(augmentation_params, dataset, pos_tag_word_map_list, tokenizer=BasicTokenizer):
+    iters = []
+    for _ in range(augmentation_params['n_iter']):
+        data = {}
+        for column in dataset.column_names:
+          data[column] = []
+        try:
+          for row in dataset:
+            res = []
+            for word, pos_tag in nltk.pos_tag(tokenizer.tokenize(row['sentence'])):
+              X = random.uniform(0,1)
+              if X < augmentation_params['p_mask']:
+                res.append('[MASK]')
+              elif X < augmentation_params['p_pos']:
+                res.append(random.choice(pos_tag_word_map_list[pos_tag]))
+              else:
+                res.append(word)
+            if random.uniform(0,1) < augmentation_params['p_ng']:
+              n_gram_length = random.randint(20, 70)
+              start = random.randrange(max(1, len(res)-n_gram_length))
+              res = res[start: start+n_gram_length]
+            synthetic_sample = ' '.join(res)
+            data['sentence'].append(synthetic_sample)
+            data['idx'].append(row["idx"])
+            data['label'].append(row['label'])
+          iters.append(data)
+        except Exception as e:
+            print(e)
+    return iters
+
+def get_vocab(dataset):
+    all_tokens = []
+    for data in dataset:
+        for token in data:
+            all_tokens.append(token)
+    vocab = set(all_tokens)
+    return vocab
+
+def get_embeddings_indeces(glove_file_path):  
+    embeddings_index = {}
+    with open(glove_file_path, encoding='utf-8') as f:
+        for line in f:
+            word, coefs = line.split(maxsplit=1)
+            coefs = np.fromstring(coefs, "f", sep=" ")
+            embeddings_index[word] = coefs
+    print(f"Found {len(embeddings_index)} word vectors.")
+    return embeddings_index
+
+def get_embedding_matrix(num_tokens, embedding_dim, word_index, embeddings_index):
+    hits = 0
+    misses = 0
+    embedding_matrix = np.zeros((num_tokens, embedding_dim))
+
+    for word, i in word_index.items():
+        embedding_vector = embeddings_index.get(word)
+        if embedding_vector is not None:
+            embedding_matrix[i] = embedding_vector
+            hits += 1
+        else:
+            misses += 1
+    embedding_matrix = torch.tensor(embedding_matrix, dtype=torch.float32)
+    print(f"Converted {hits} words ({misses}) misses")
+    return embedding_matrix
+
+def padd(data, max_length):
+    padding_length = max_length - len(data)
+    if padding_length > 0:
+        padding = [0 for _ in range(padding_length)]
+        data.extend(padding)
+    return data[:max_length]
+
+def generate_real_test_file_sst2(logits, filename):
+    labels = []
+    labels.append("id\tlabel\n")
+    for index, logit in enumerate(logits):
+        labels.append(f"{index}\t{torch.topk(torch.as_tensor(logit), k=1).indices.numpy()[0]}\n")
+
+    with open(filename, "w") as file:
+        file.writelines(labels)
+    print(f"Created output file named: {filename} upload it to GLUE benchmark to obtain results!")
