@@ -1,0 +1,12 @@
+spacy
+nltk
+transformers[torch]
+huggingface_hub
+datasets
+evaluate
+torchvision
+kagglehub
+ipywidgets
+numpy
+pandas
+tqdm

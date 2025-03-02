@@ -362,7 +362,7 @@ class Custom_training_args(TrainingArguments):
         self.temperature = temperature
 
 
-def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e-5, epochs=5, weight_decay=0, lambda_param=.5, temp=5, batch_size=128):
+def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e-5, epochs=5, weight_decay=0, lambda_param=.5, temp=5, batch_size=128, num_workers=4):
     """Returns training args that can be adjusted."""
     return (
         Custom_training_args(
@@ -382,7 +382,8 @@ def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e
         logging_dir=logging_dir,
         remove_unused_columns=remove_unused_columns,
         lambda_param = lambda_param, 
-        temperature = temp
+        temperature = temp,
+        dataloader_num_workers=num_workers
     ))
 
 
@@ -472,10 +473,10 @@ def prepare_dataset(dataset, tokenizer):
 
 
 class BiLSTMClassifier(nn.Module):
-    def __init__(self, embedding_dim, hidden_dim, fc_dim, output_dim, embedding_matrix):
+    def __init__(self, embedding_dim, hidden_dim, fc_dim, output_dim, embedding_matrix, freeze_embed = True):
         super(BiLSTMClassifier, self).__init__()
         
-        self.embedding = nn.Embedding.from_pretrained(embedding_matrix, freeze=True)
+        self.embedding = nn.Embedding.from_pretrained(embedding_matrix, freeze=freeze_embed)
         self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers=1, bidirectional=True, batch_first=True)
         self.fc1 = nn.Linear(hidden_dim * 2, fc_dim)  
         self.dropout = nn.Dropout(.2)
@@ -512,7 +513,7 @@ def get_pos_tag_word_map(sentences, tokenizer=BasicTokenizer(do_lower_case=True)
         pos_tag_word_map_list[pos_tag] = list(pos_tag_word_map[pos_tag])
     return pos_tag_word_map_list
 
-def get_augmented_dataset(augmentation_params, dataset, pos_tag_word_map_list, tokenizer=BasicTokenizer):
+def get_augmented_dataset(augmentation_params, dataset, pos_tag_word_map_list, tokenizer=BasicTokenizer, include_idx=True):
     iters = []
     for _ in range(augmentation_params['n_iter']):
         data = {}
@@ -535,7 +536,7 @@ def get_augmented_dataset(augmentation_params, dataset, pos_tag_word_map_list, t
               res = res[start: start+n_gram_length]
             synthetic_sample = ' '.join(res)
             data['sentence'].append(synthetic_sample)
-            data['idx'].append(row["idx"])
+            data['idx'].append(row["idx"]) if include_idx else ""
             data['label'].append(row['label'])
           iters.append(data)
         except Exception as e:
@@ -567,7 +568,7 @@ def get_embedding_matrix(num_tokens, embedding_dim, word_index, embeddings_index
 
     for word, i in word_index.items():
         embedding_vector = embeddings_index.get(word)
-        if embedding_vector is not None:
+        if embedding_vector is not None and len(embedding_vector) != 0:
             embedding_matrix[i] = embedding_vector
             hits += 1
         else:
