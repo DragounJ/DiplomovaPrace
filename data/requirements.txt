@@ -10,3 +10,6 @@ ipywidgets
 numpy
 pandas
 tqdm
+timm
+optuna
+torch+cu126

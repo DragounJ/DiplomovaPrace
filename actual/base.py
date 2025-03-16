@@ -1,6 +1,7 @@
 from transformers import Trainer, TrainingArguments, MobileNetV2Config, MobileNetV2ForImageClassification, BasicTokenizer
 from torchvision.transforms import v2 as transformsv2
 from torch.utils.data import Dataset
+from torch.utils import benchmark
 import torch.nn.functional as F
 from tqdm.notebook import tqdm
 from enum import Enum
@@ -13,6 +14,7 @@ import pickle
 import random
 import torch
 import nltk
+import time
 import os
 
 nltk.download('averaged_perceptron_tagger')
@@ -41,10 +43,12 @@ def reset_seed(seed=42):
 
 class CustomCIFAR10L(Dataset):
     """Custom Dataset wrapper for CIFAR10 datasets with modifications (logits). Used for working with pytorch dataset within huggingface."""
-    def __init__(self, root, dataset_part = dataset_part.TRAIN, transform=None):
+    def __init__(self, root, dataset_part = dataset_part.TRAIN, transform=None, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")):
         self.root = root
         self.dataset_part = dataset_part
         self.transform = transform
+        self.device = device
+
         self.data = []
         self.targets = []
         self.logits = []
@@ -93,9 +97,9 @@ class CustomCIFAR10L(Dataset):
             image = self.transform(image)            
 
         return {
-            'pixel_values': image,
-            'labels': label,
-            'logits': logit,
+            'pixel_values': image.to(self.device),
+            'labels': label.to(self.device),
+            'logits': logit.to(self.device),
         }
     
     def remove_entries(self, remove_list):
@@ -110,11 +114,11 @@ class CustomCIFAR10L(Dataset):
 
 class CustomCIFAR100L(Dataset):
     """Custom Dataset wrapper for CIFAR100 datasets with modifications (logits). Used for working with pytorch dataset within huggingface."""
-    def __init__(self, root, dataset_part = dataset_part.TRAIN, transform=None):
+    def __init__(self, root, dataset_part = dataset_part.TRAIN, transform=None, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")):
         self.root = root
         self.dataset_part = dataset_part
         self.transform = transform
-        
+        self.device = device
 
         self.data = []
         self.targets = []
@@ -153,7 +157,6 @@ class CustomCIFAR100L(Dataset):
     def __getitem__(self, index):
         image = self.data[index].reshape(3, 32, 32).transpose(1, 2, 0)
         label = self.targets[index]
-        #logit = self.logits[index]
         
         image = Image.fromarray(image.astype('uint8'), 'RGB')
         
@@ -161,13 +164,15 @@ class CustomCIFAR100L(Dataset):
             logit = self.logits[index] if len(self.transform.extra_repr()) < 300 else self.logits_aug[index]
             torch.manual_seed(index)
             image = self.transform(image)
+        else:
+            logit = self.logits[index]
 
         logit = torch.tensor(logit, dtype=torch.float)
 
         return {
-            'pixel_values': image,
-            'labels': label,
-            'logits': logit
+            'pixel_values': image.to(self.device),
+            'labels': label.to(self.device),
+            'logits': logit.to(self.device),
         }
     
     def remove_entries(self, remove_list):
@@ -183,11 +188,11 @@ class CustomCIFAR100L(Dataset):
 class CustomCIFAR10(Dataset):
     """Custom Dataset wrapper for CIFAR10 datasets wihout any changes made. Used for working with pytorch dataset within huggingface."""
 
-    def __init__(self, root, batch=None, train=True, transform=None):
+    def __init__(self, root, batch=None, train=True, transform=None, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")):
         self.root = root
         self.train = train
         self.transform = transform
-        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self.device = device
 
         if self.train:
             self.data_file = os.path.join(self.root, 'cifar-10-batches-py', f'data_batch_{batch}')
@@ -199,7 +204,6 @@ class CustomCIFAR10(Dataset):
             self.data = dict[b'data']
             self.labels = dict[b'labels']
 
-        #self.labels = nn.functional.one_hot(torch.as_tensor(self.labels),10)
 
     def __len__(self):
         return len(self.data)
@@ -214,15 +218,18 @@ class CustomCIFAR10(Dataset):
             image = self.transform(image)
 
 
-        return  image.to(self.device), label.to(self.device)
+        return  {
+            "pixel_values": image.to(self.device), 
+            "labels": label.to(self.device)
+            }
     
 class CustomCIFAR100(Dataset):
     """Custom Dataset wrapper for CIFAR100 datasets wihout any changes made. Used for working with pytorch dataset within huggingface."""
-    def __init__(self, root, train=True, transform=None):
+    def __init__(self, root, train=True, transform=None, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")):
         self.root = root
         self.train = train
         self.transform = transform
-        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self.device = device
 
         if self.train:
             self.data_file = os.path.join(self.root, 'cifar-100-python', 'train')
@@ -247,7 +254,10 @@ class CustomCIFAR100(Dataset):
             torch.manual_seed(index)
             image = self.transform(image)
 
-        return  image.to(self.device), label.to(self.device)
+        return  {
+            "pixel_values": image.to(self.device), 
+            "labels": label.to(self.device)
+            }
         
 
 
@@ -284,25 +294,16 @@ def pickle_up(file, contents):
         pickle.dump(contents, fo, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def generate_logits(dataloader, model, images=True):
+def generate_logits(dataloader, model):
     """Generates logits for given input."""
     logits_arr = []
     for batch in tqdm(dataloader, desc="Generating logits for given dataset: "):
-        
         with torch.no_grad():
-            if images:
-                pixel_values, labels = batch
-                outputs = model(pixel_values)
-            else:
-                outputs = model(**batch)
-
+            outputs = model(**batch)
             logits = outputs["logits"]
-        logits_arr.append(logits.cpu().numpy())
-
-    logits_arr_flat = []
-    for tensor in logits_arr:
-        logits_arr_flat.extend(tensor)
-    return logits_arr_flat
+            
+        logits_arr.extend(logits.cpu().numpy())
+    return logits_arr
 
 
 
@@ -362,12 +363,14 @@ class Custom_training_args(TrainingArguments):
         self.temperature = temperature
 
 
-def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e-5, epochs=5, weight_decay=0, lambda_param=.5, temp=5, batch_size=128, num_workers=4):
+def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e-5, epochs=5, weight_decay=0, adam_beta1 = .9, lambda_param=.5, temp=5, batch_size=128, num_workers=4, warmup_steps=0):
     """Returns training args that can be adjusted."""
     return (
         Custom_training_args(
         output_dir=output_dir,
         eval_strategy="epoch",
+        adam_beta1 = adam_beta1,
+        warmup_steps = warmup_steps,
         save_strategy="epoch",
         logging_strategy="epoch",
         learning_rate=lr, #Defaultní hodnota 
@@ -383,7 +386,7 @@ def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e
         remove_unused_columns=remove_unused_columns,
         lambda_param = lambda_param, 
         temperature = temp,
-        dataloader_num_workers=num_workers
+        dataloader_num_workers=num_workers,
     ))
 
 
@@ -493,9 +496,8 @@ class BiLSTMClassifier(nn.Module):
         logits = self.fc2(dropped)
         
         if labels is not None:
-            labels = nn.functional.one_hot(labels, num_classes=self.fc2.out_features) 
             loss_fn = nn.CrossEntropyLoss() 
-            loss = loss_fn(logits, labels.float())
+            loss = loss_fn(logits, labels)
             return {"loss" : loss, "logits" : logits}
         return {"loss" : None, "logits": logits}
     
@@ -593,3 +595,25 @@ def generate_real_test_file_sst2(logits, filename):
     with open(filename, "w") as file:
         file.writelines(labels)
     print(f"Created output file named: {filename} upload it to GLUE benchmark to obtain results!")
+
+class BenchMarkRunner:
+    def __init__(self, model, data_loader, device, num_tries):
+        self.model = model.to(device)
+        self.data_loader = data_loader
+        self.num_tries = num_tries
+
+    def infer_speed_comp(self):
+        for batch in self.data_loader:
+            with torch.no_grad():
+                _ = self.model(**batch)
+            break
+
+    def run_benchmark(self):    
+        timer = benchmark.Timer(
+                stmt="self.infer_speed_comp()",
+                globals={"self": self},
+                num_threads=torch.get_num_threads(),
+            )
+        
+        return timer.timeit(self.num_tries)
+    
