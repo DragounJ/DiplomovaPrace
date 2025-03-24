@@ -15,6 +15,7 @@ import random
 import torch
 import nltk
 import time
+import io
 import os
 
 nltk.download('averaged_perceptron_tagger')
@@ -40,6 +41,26 @@ def reset_seed(seed=42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
+def base_transforms():
+    """Standard transformation for images within datasets (resize, normalize, convert)."""
+    return transformsv2.Compose([
+                transformsv2.ToImage(),
+                transformsv2.ToDtype(torch.float32, scale=True),
+                transformsv2.Resize((224, 224), antialias=True),
+                transformsv2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+
+def aug_transforms():
+    """Standard + Augmentation transformation for images within datasets (resize, normalize, convert) + (flips, rotation)."""
+    return transformsv2.Compose([ 
+                transformsv2.ToImage(),
+                transformsv2.ToDtype(torch.float32, scale=True),
+                transformsv2.Resize(size=(224, 224), antialias=True),
+                transformsv2.RandomHorizontalFlip(),
+                transformsv2.RandomVerticalFlip(),
+                transformsv2.RandomRotation(15),
+                transformsv2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
 
 class CustomCIFAR10L(Dataset):
     """Custom Dataset wrapper for CIFAR10 datasets with modifications (logits). Used for working with pytorch dataset within huggingface."""
@@ -63,16 +84,12 @@ class CustomCIFAR10L(Dataset):
                      self.targets.extend(dict[b'labels'])
                      self.logits.extend(dict[b'logits'])
                      self.logits_aug.extend(dict[b'logits_aug'])   
-
-        elif self.dataset_part == dataset_part.TEST:
-            data_file = os.path.join(self.root, 'cifar-10-batches-py', 'test')
-            with open(data_file, 'rb') as fo:
-                dict = pickle.load(fo, encoding='bytes')
-                self.data.append(dict[b'data'])
-                self.targets.extend(dict[b'labels'])
-                self.logits.extend(dict[b'logits'])
         else:
-            data_file = os.path.join(self.root, 'cifar-10-batches-py', 'eval')
+            if self.dataset_part == dataset_part.TEST:
+                data_file = os.path.join(self.root, 'cifar-10-batches-py', 'test')
+            
+            else:
+                data_file = os.path.join(self.root, 'cifar-10-batches-py', 'eval')
             with open(data_file, "rb") as fo:
                 dict = pickle.load(fo, encoding='bytes')
                 self.data.append(dict[b'data'])
@@ -125,30 +142,18 @@ class CustomCIFAR100L(Dataset):
         self.logits = []
         self.logits_aug = []
 
-
         if self.dataset_part == dataset_part.TRAIN:
-            data_file = os.path.join(self.root, 'cifar-100-python', 'train')
-            with open(data_file, 'rb') as fo:
-                dict = pickle.load(fo, encoding='bytes')
-                self.data.append(dict[b'data'])
-                self.targets.extend(dict[b'fine_labels'])
-                self.logits.extend(dict[b'logits'])  
-                self.logits_aug.extend(dict[b'logits_aug'])   
+            data_file = os.path.join(self.root, 'cifar-100-python', 'train')  
         elif self.dataset_part == dataset_part.TEST:
-            data_file = os.path.join(self.root, 'cifar-100-python', 'test')
-            with open(data_file, 'rb') as fo:
-                dict = pickle.load(fo, encoding='bytes')
-                self.data.append(dict[b'data'])
-                self.targets.extend(dict[b'fine_labels'])
-                self.logits.extend(dict[b'logits'])  
+            data_file = os.path.join(self.root, 'cifar-100-python', 'test') 
         else:
             data_file = os.path.join(self.root, 'cifar-100-python', 'eval')
-            with open(data_file, 'rb') as fo:
-                dict = pickle.load(fo, encoding='bytes')
-                self.data.append(dict[b'data'])
-                self.targets.extend(dict[b'fine_labels'])
-                self.logits.extend(dict[b'logits'])  
-            
+
+        with open(data_file, 'rb') as fo:
+            dict = pickle.load(fo, encoding='bytes')
+            self.data.append(dict[b'data'])
+            self.targets.extend(dict[b'fine_labels'])
+            self.logits.extend(dict[b'logits'])  
         self.data = np.concatenate(self.data, axis=0)
 
     def __len__(self):
@@ -225,7 +230,7 @@ class CustomCIFAR10(Dataset):
     
 class CustomCIFAR100(Dataset):
     """Custom Dataset wrapper for CIFAR100 datasets wihout any changes made. Used for working with pytorch dataset within huggingface."""
-    def __init__(self, root, train=True, transform=None, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")):
+    def __init__(self, root, train=True, transform=base_transforms(), device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")):
         self.root = root
         self.train = train
         self.transform = transform
@@ -259,28 +264,6 @@ class CustomCIFAR100(Dataset):
             "labels": label.to(self.device)
             }
         
-
-
-def base_transforms():
-    """Standard transformation for images within datasets (resize, normalize, convert)."""
-    return transformsv2.Compose([
-                transformsv2.ToImage(),
-                transformsv2.ToDtype(torch.float32, scale=True),
-                transformsv2.Resize((224, 224), antialias=True),
-                transformsv2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-
-def aug_transforms():
-    """Standard + Augmentation transformation for images within datasets (resize, normalize, convert) + (flips, rotation)."""
-    return transformsv2.Compose([ 
-                transformsv2.ToImage(),
-                transformsv2.ToDtype(torch.float32, scale=True),
-                transformsv2.Resize(size=(224, 224), antialias=True),
-                transformsv2.RandomHorizontalFlip(),
-                transformsv2.RandomVerticalFlip(),
-                transformsv2.RandomRotation(15),
-                transformsv2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
 
 def unpickle(file):
     """Opening dataset files with pickle."""
