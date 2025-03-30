@@ -10,13 +10,17 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 import evaluate
+import nbformat
 import pickle
 import random
 import torch
 import nltk
 import time
+import ast
 import io
 import os
+import re
+
 
 nltk.download('averaged_perceptron_tagger')
 nltk.download('punkt')
@@ -64,7 +68,7 @@ def aug_transforms():
 
 class CustomCIFAR10L(Dataset):
     """Custom Dataset wrapper for CIFAR10 datasets with modifications (logits). Used for working with pytorch dataset within huggingface."""
-    def __init__(self, root, dataset_part = dataset_part.TRAIN, transform=None, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")):
+    def __init__(self, root, dataset_part = dataset_part.TRAIN, transform=None, device=torch.device("cpu")):
         self.root = root
         self.dataset_part = dataset_part
         self.transform = transform
@@ -105,7 +109,7 @@ class CustomCIFAR10L(Dataset):
     def __getitem__(self, index):
         image = self.data[index].reshape(3, 32, 32).transpose(1, 2, 0)
         image = Image.fromarray(image.astype('uint8'), 'RGB')
-        label = self.targets[index]
+        label = torch.as_tensor(self.labels[index])
 
         if self.transform:
             logit = self.logits[index] if len(self.transform.extra_repr()) < 300 else self.logits_aug[index]
@@ -131,7 +135,7 @@ class CustomCIFAR10L(Dataset):
 
 class CustomCIFAR100L(Dataset):
     """Custom Dataset wrapper for CIFAR100 datasets with modifications (logits). Used for working with pytorch dataset within huggingface."""
-    def __init__(self, root, dataset_part = dataset_part.TRAIN, transform=None, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")):
+    def __init__(self, root, dataset_part = dataset_part.TRAIN, transform=None, device=torch.device("cpu")):
         self.root = root
         self.dataset_part = dataset_part
         self.transform = transform
@@ -144,6 +148,10 @@ class CustomCIFAR100L(Dataset):
 
         if self.dataset_part == dataset_part.TRAIN:
             data_file = os.path.join(self.root, 'cifar-100-python', 'train')  
+            with open(data_file, 'rb') as fo:
+                dict = pickle.load(fo, encoding='bytes')
+                self.logits_aug.extend(dict[b'logits_aug'])
+                
         elif self.dataset_part == dataset_part.TEST:
             data_file = os.path.join(self.root, 'cifar-100-python', 'test') 
         else:
@@ -154,6 +162,7 @@ class CustomCIFAR100L(Dataset):
             self.data.append(dict[b'data'])
             self.targets.extend(dict[b'fine_labels'])
             self.logits.extend(dict[b'logits'])  
+            
         self.data = np.concatenate(self.data, axis=0)
 
     def __len__(self):
@@ -161,7 +170,7 @@ class CustomCIFAR100L(Dataset):
 
     def __getitem__(self, index):
         image = self.data[index].reshape(3, 32, 32).transpose(1, 2, 0)
-        label = self.targets[index]
+        label = torch.as_tensor(self.labels[index])
         
         image = Image.fromarray(image.astype('uint8'), 'RGB')
         
@@ -193,7 +202,7 @@ class CustomCIFAR100L(Dataset):
 class CustomCIFAR10(Dataset):
     """Custom Dataset wrapper for CIFAR10 datasets wihout any changes made. Used for working with pytorch dataset within huggingface."""
 
-    def __init__(self, root, batch=None, train=True, transform=None, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")):
+    def __init__(self, root, batch=None, train=True, transform=None, device=torch.device("cpu")):
         self.root = root
         self.train = train
         self.transform = transform
@@ -230,7 +239,7 @@ class CustomCIFAR10(Dataset):
     
 class CustomCIFAR100(Dataset):
     """Custom Dataset wrapper for CIFAR100 datasets wihout any changes made. Used for working with pytorch dataset within huggingface."""
-    def __init__(self, root, train=True, transform=base_transforms(), device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")):
+    def __init__(self, root, train=True, transform=base_transforms(), device=torch.device("cpu")):
         self.root = root
         self.train = train
         self.transform = transform
@@ -425,7 +434,67 @@ class DistilTrainer(Trainer):
 
         loss = ((1. - self.lambda_param) * student_target_loss + self.lambda_param * distillation_loss)
         return (loss, student_output) if return_outputs else loss
+
+class DistilTrainerInfer(Trainer):
+    """Distilation trainer, computes loss with logits from teacher in mind. Logits are precomputed."""
+    def __init__(self, student_model=None, teacher_model=None, *args, **kwargs):
+        super().__init__(model=student_model, *args, **kwargs)
+        self.student = student_model
+        self.teacher = teacher_model
+        self.loss_function = nn.KLDivLoss(reduction="batchmean")
+        self.temperature = self.args.temperature
+        self.lambda_param = self.args.lambda_param
+
+    def compute_loss(self, student, inputs, return_outputs=False, num_items_in_batch=None):
+        _ = inputs.pop("logits")
+        
+        student_output = student(**inputs)
+        with torch.no_grad():
+            teacher_output = self.teacher(**inputs)
+
+        soft_teacher = F.softmax(teacher_output['logits'] / self.temperature, dim=-1)
+        soft_student = F.log_softmax(student_output['logits'] / self.temperature, dim=-1)
+
+        distillation_loss = self.loss_function(soft_student, soft_teacher) * (self.temperature ** 2)
+        student_target_loss = student_output["loss"]
+
+        loss = ((1. - self.lambda_param) * student_target_loss + self.lambda_param * distillation_loss)
+        return (loss, student_output) if return_outputs else loss
     
+
+class DistilTrainerInferText(Trainer):
+    """Distilation trainer, computes loss with logits from teacher in mind. Logits are precomputed."""
+    def __init__(self, student_model=None, teacher_model=None, *args, **kwargs):
+        super().__init__(model=student_model, *args, **kwargs)
+        self.student = student_model
+        self.teacher = teacher_model
+        self.loss_function = nn.KLDivLoss(reduction="batchmean")
+        self.temperature = self.args.temperature
+        self.lambda_param = self.args.lambda_param
+
+    def compute_loss(self, student, inputs, return_outputs=False, num_items_in_batch=None):
+        _ = inputs.pop("logits")
+        teacher_ids = inputs.pop("teacher_ids")
+        teacher_attention = inputs.pop("teacher_attention")
+
+        student_output = student(**inputs)
+        with torch.no_grad():
+            teacher_output = self.teacher(teacher_ids, attention_mask=teacher_attention, labels=inputs["labels"])
+
+        soft_teacher = F.softmax(teacher_output['logits'] / self.temperature, dim=-1)
+        soft_student = F.log_softmax(student_output['logits'] / self.temperature, dim=-1)
+
+        distillation_loss = self.loss_function(soft_student, soft_teacher) * (self.temperature ** 2)
+        student_target_loss = student_output["loss"]
+
+        loss = ((1. - self.lambda_param) * student_target_loss + self.lambda_param * distillation_loss)
+        return (loss, student_output) if return_outputs else loss
+    
+def prepare_dataset_teacher(dataset, tokenizer):
+    dataset = dataset.map(lambda e: tokenizer(e['sentence'], truncation=True, padding='max_length', return_tensors="pt", max_length=60), batched=True, desc="Tokenizing the provided dataset")
+    return (dataset["input_ids"], dataset["attention_mask"])
+
+
 def count_parameters(model):
     table_header = [["Modules", "Parameters"]]
     table = []
@@ -483,6 +552,99 @@ class BiLSTMClassifier(nn.Module):
             loss = loss_fn(logits, labels)
             return {"loss" : loss, "logits" : logits}
         return {"loss" : None, "logits": logits}
+    
+def extract_trials_with_f1(nb_path, study_names=None):
+    def extract_params_from_line(line):
+        match = re.search(r"\{(.+?)\}", line)
+        if not match:
+            return {}
+        try:
+            return ast.literal_eval("{" + match.group(1) + "}")
+        except:
+            return {}
+
+    def parse_trial_line_with_number(line):
+        match = re.match(r"Trial (\d+) with params: (.+)", line)
+        if not match:
+            return None
+        trial_number = int(match.group(1))
+        try:
+            params = ast.literal_eval(match.group(2))
+            params["trial_number"] = trial_number
+            return params
+        except:
+            return None
+
+    def extract_f1_with_params(line):
+        m = re.search(r"Trial (\d+) finished with value: ([0-9.]+)", line)
+        if not m:
+            return None
+        f1 = float(m.group(2))
+        params = extract_params_from_line(line)
+        return {"f1_score": f1, **params}
+
+    def split_into_blocks(lines, start_indicator):
+        blocks = []
+        current_block = []
+        for line in lines:
+            if start_indicator in line and current_block:
+                blocks.append(current_block)
+                current_block = []
+            current_block.append(line)
+        if current_block:
+            blocks.append(current_block)
+        return blocks
+
+    with open(nb_path, 'r', encoding='utf-8') as f:
+        nb = nbformat.read(f, as_version=4)
+
+    trial_param_lines = []
+    trial_f1_lines = []
+    for cell in nb.cells:
+        if cell.cell_type == "code" and "outputs" in cell:
+            for output in cell["outputs"]:
+                if output.output_type == "stream":
+                    for line in output["text"].split("\n"):
+                        if re.match(r"Trial \d+ with params:", line):
+                            trial_param_lines.append(line.strip())
+                        elif re.search(r"Trial \d+ finished with value: [0-9.]+", line):
+                            trial_f1_lines.append(line.strip())
+
+
+    all_trial_params = [parse_trial_line_with_number(line) for line in trial_param_lines]
+    all_trial_params = [x for x in all_trial_params if x is not None]
+
+    all_f1_entries = [extract_f1_with_params(line) for line in trial_f1_lines]
+    all_f1_entries = [x for x in all_f1_entries if x is not None]
+
+
+    trial_blocks = split_into_blocks(trial_param_lines, "Trial 0 with params:")
+    trial_block_lengths = [len(block) for block in trial_blocks]
+
+
+    matched_trials_final = []
+    trial_index = 0
+    for block_idx, block_len in enumerate(trial_block_lengths):
+        for i in range(block_len):
+            trial = all_trial_params[trial_index]
+            trial_index += 1
+
+            matched_f1 = None
+            for f1_entry in all_f1_entries:
+                if (
+                    abs(trial["learning_rate"] - f1_entry.get("learning_rate", -1)) < 1e-10 and
+                    trial["weight_decay"] == f1_entry.get("weight_decay") and
+                    trial["warmup_steps"] == f1_entry.get("warmup_steps")
+                ):
+                    matched_f1 = f1_entry["f1_score"]
+                    break
+
+            trial["f1_score"] = matched_f1
+            if study_names and block_idx < len(study_names):
+                trial["study_name"] = study_names[block_idx]
+            matched_trials_final.append(trial)
+
+    return pd.DataFrame(matched_trials_final)
     
 
 def get_pos_tag_word_map(sentences, tokenizer=BasicTokenizer(do_lower_case=True)):
