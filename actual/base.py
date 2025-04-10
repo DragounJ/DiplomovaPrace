@@ -1,4 +1,5 @@
 from transformers import Trainer, TrainingArguments, MobileNetV2Config, MobileNetV2ForImageClassification, BasicTokenizer
+from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
 from torchvision.transforms import v2 as transformsv2
 from torch.utils.data import Dataset
 from torch.utils import benchmark
@@ -10,16 +11,12 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 import evaluate
-import nbformat
 import pickle
 import random
 import torch
 import nltk
-import time
-import ast
-import io
 import os
-import re
+
 
 
 nltk.download('averaged_perceptron_tagger')
@@ -349,13 +346,13 @@ def compute_metrics(eval_pred):
 
 class Custom_training_args(TrainingArguments):
     """Custom wrapper of training args for distillation."""
-    def __init__(self, lambda_param, temperature, *args, **kwargs):
+    def __init__(self, lambda_param, temperature, alpha_param, *args, **kwargs):
         super().__init__(*args, **kwargs)    
         self.lambda_param = lambda_param
         self.temperature = temperature
+        self.alpha_param = alpha_param        
 
-
-def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e-5, epochs=5, weight_decay=0, adam_beta1 = .9, lambda_param=.5, temp=5, batch_size=128, num_workers=4, warmup_steps=0):
+def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e-5, epochs=5, weight_decay=0, adam_beta1 = .9, lambda_param=.5, temp=5, batch_size=128, num_workers=4, alpha_param = .5, warmup_steps=0):
     """Returns training args that can be adjusted."""
     return (
         Custom_training_args(
@@ -377,10 +374,11 @@ def get_training_args(output_dir, logging_dir, remove_unused_columns=True, lr=5e
         logging_dir=logging_dir,
         remove_unused_columns=remove_unused_columns,
         lambda_param = lambda_param, 
+        alpha_param = alpha_param, 
         temperature = temp,
         dataloader_num_workers=num_workers,
-    ))
 
+    ))
 
 def get_random_init_mobilenet(num_labels):
     """Returns randomly initialized MobileNetV2."""
@@ -490,6 +488,71 @@ class DistilTrainerInferText(Trainer):
         loss = ((1. - self.lambda_param) * student_target_loss + self.lambda_param * distillation_loss)
         return (loss, student_output) if return_outputs else loss
     
+class DistilTrainerInner(Trainer):
+    """Distilation trainer, computes loss with logits from teacher in mind. Logits are precomputed."""
+    def __init__(self, student_model=None, teacher_model = None, *args, **kwargs):
+        super().__init__(model=student_model, *args, **kwargs)
+        self.student = student_model
+        self.teacher = teacher_model
+        self.layer_loss_function = nn.MSELoss()
+        self.logit_loss_function = nn.KLDivLoss(reduction="batchmean")
+        self.temperature = self.args.temperature
+        self.lambda_param = self.args.lambda_param
+        self.alpha_param = self.args.alpha_param
+
+        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self.student_to_teacher = nn.Linear(128, 768).to(self.device)
+        self.model_parameters = list(self.model.parameters()) + list(self.student_to_teacher.parameters())
+
+    def compute_loss(self, student, inputs, return_outputs=False, num_items_in_batch=None):
+        logits = inputs.pop("logits")
+        
+        student_output = student(**inputs, output_hidden_states=True)
+        student_target_loss = student_output["loss"]
+
+        with torch.no_grad():
+            teacher_output = self.teacher(**inputs, output_hidden_states=True)
+
+        teacher_hidden_states = teacher_output.hidden_states
+        student_hidden_states = student_output.hidden_states
+
+        teacher_l6 = teacher_hidden_states[6] / self.temperature
+        teacher_l12 = teacher_hidden_states[12] / self.temperature
+        student_l1 = student_hidden_states[1]
+        student_l2 = student_hidden_states[2] 
+
+        student_l1_projection = self.student_to_teacher(student_l1) / self.temperature
+        student_l2_projection = self.student_to_teacher(student_l2) / self.temperature
+
+        layer_distillation_loss = (
+            self.layer_loss_function(student_l1_projection, teacher_l6) +
+            self.layer_loss_function(student_l2_projection, teacher_l12)
+        )
+
+        
+
+        soft_teacher = F.softmax(logits / self.temperature, dim=-1)
+        soft_student = F.log_softmax(student_output['logits'] / self.temperature, dim=-1)
+
+        logit_distillation_loss = self.logit_loss_function(soft_student, soft_teacher) * (self.temperature ** 2)
+        logit_label_loss = ((1. - self.lambda_param) * student_target_loss + self.lambda_param * logit_distillation_loss)
+
+        
+        loss = (1 - self.alpha_param) * logit_label_loss + self.alpha_param * layer_distillation_loss
+
+        
+        return (loss, student_output) if return_outputs else loss
+    
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        logits = inputs.pop("logits")
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            outputs = model(**inputs, output_hidden_states=False)
+            loss = outputs.loss if "loss" in outputs else None
+            logits = outputs.logits
+        labels = inputs.get("labels")
+        return loss, logits, labels
+        
 def prepare_dataset_teacher(dataset, tokenizer):
     dataset = dataset.map(lambda e: tokenizer(e['sentence'], truncation=True, padding='max_length', return_tensors="pt", max_length=60), batched=True, desc="Tokenizing the provided dataset")
     return (dataset["input_ids"], dataset["attention_mask"])
@@ -552,100 +615,7 @@ class BiLSTMClassifier(nn.Module):
             loss = loss_fn(logits, labels)
             return {"loss" : loss, "logits" : logits}
         return {"loss" : None, "logits": logits}
-    
-def extract_trials_with_f1(nb_path, study_names=None):
-    def extract_params_from_line(line):
-        match = re.search(r"\{(.+?)\}", line)
-        if not match:
-            return {}
-        try:
-            return ast.literal_eval("{" + match.group(1) + "}")
-        except:
-            return {}
-
-    def parse_trial_line_with_number(line):
-        match = re.match(r"Trial (\d+) with params: (.+)", line)
-        if not match:
-            return None
-        trial_number = int(match.group(1))
-        try:
-            params = ast.literal_eval(match.group(2))
-            params["trial_number"] = trial_number
-            return params
-        except:
-            return None
-
-    def extract_f1_with_params(line):
-        m = re.search(r"Trial (\d+) finished with value: ([0-9.]+)", line)
-        if not m:
-            return None
-        f1 = float(m.group(2))
-        params = extract_params_from_line(line)
-        return {"f1_score": f1, **params}
-
-    def split_into_blocks(lines, start_indicator):
-        blocks = []
-        current_block = []
-        for line in lines:
-            if start_indicator in line and current_block:
-                blocks.append(current_block)
-                current_block = []
-            current_block.append(line)
-        if current_block:
-            blocks.append(current_block)
-        return blocks
-
-    with open(nb_path, 'r', encoding='utf-8') as f:
-        nb = nbformat.read(f, as_version=4)
-
-    trial_param_lines = []
-    trial_f1_lines = []
-    for cell in nb.cells:
-        if cell.cell_type == "code" and "outputs" in cell:
-            for output in cell["outputs"]:
-                if output.output_type == "stream":
-                    for line in output["text"].split("\n"):
-                        if re.match(r"Trial \d+ with params:", line):
-                            trial_param_lines.append(line.strip())
-                        elif re.search(r"Trial \d+ finished with value: [0-9.]+", line):
-                            trial_f1_lines.append(line.strip())
-
-
-    all_trial_params = [parse_trial_line_with_number(line) for line in trial_param_lines]
-    all_trial_params = [x for x in all_trial_params if x is not None]
-
-    all_f1_entries = [extract_f1_with_params(line) for line in trial_f1_lines]
-    all_f1_entries = [x for x in all_f1_entries if x is not None]
-
-
-    trial_blocks = split_into_blocks(trial_param_lines, "Trial 0 with params:")
-    trial_block_lengths = [len(block) for block in trial_blocks]
-
-
-    matched_trials_final = []
-    trial_index = 0
-    for block_idx, block_len in enumerate(trial_block_lengths):
-        for i in range(block_len):
-            trial = all_trial_params[trial_index]
-            trial_index += 1
-
-            matched_f1 = None
-            for f1_entry in all_f1_entries:
-                if (
-                    abs(trial["learning_rate"] - f1_entry.get("learning_rate", -1)) < 1e-10 and
-                    trial["weight_decay"] == f1_entry.get("weight_decay") and
-                    trial["warmup_steps"] == f1_entry.get("warmup_steps")
-                ):
-                    matched_f1 = f1_entry["f1_score"]
-                    break
-
-            trial["f1_score"] = matched_f1
-            if study_names and block_idx < len(study_names):
-                trial["study_name"] = study_names[block_idx]
-            matched_trials_final.append(trial)
-
-    return pd.DataFrame(matched_trials_final)
-    
+       
 
 def get_pos_tag_word_map(sentences, tokenizer=BasicTokenizer(do_lower_case=True)):
     pos_tag_word_map = {}
@@ -762,3 +732,17 @@ class BenchMarkRunner:
         
         return timer.timeit(self.num_tries)
     
+def get_scores(dataset):
+    preds = []
+    for val in dataset:
+        preds.append(torch.topk(val["logits"], k=1).indices.numpy()[0])
+    
+    f1 = f1_score(dataset["labels"].numpy(), preds, average="macro")
+    acc = accuracy_score(dataset["labels"].numpy(), preds)
+    precision = precision_score(dataset["labels"].numpy(), preds, average="macro")
+    recall = recall_score(dataset["labels"].numpy(), preds, average="macro")
+    
+    print(f"F1 score: {f1}")
+    print(f"Accuracy: {acc}")
+    print(f"Precision: {precision}")
+    print(f"Recall: {recall}")
