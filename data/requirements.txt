@@ -1,0 +1,14 @@
+spacy
+nltk
+transformers[torch]==4.49.0
+huggingface_hub
+datasets
+evaluate
+torchvision
+kagglehub
+ipywidgets
+numpy
+pandas
+tqdm
+timm
+optuna
